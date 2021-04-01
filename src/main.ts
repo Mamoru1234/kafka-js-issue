@@ -65,6 +65,7 @@ async function main(): Promise<void> {
           console.log('Consuming message: ', message.offset);
           await new Promise((res) => setTimeout(res, 100));
           await transaction.commit();
+          // await new Promise((res) => setTimeout(res, 100));
           resolveOffset(message.offset);
         } catch (e) {
           if (e.code === 51) {

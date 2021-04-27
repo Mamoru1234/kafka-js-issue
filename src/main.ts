@@ -1,84 +1,79 @@
-import { Kafka, Message } from 'kafkajs';
+import { Admin, Consumer, Kafka } from 'kafkajs';
+import { ConsumerMetaStorage } from './consumer-meta-storage';
 
 const kafka = new Kafka({
   brokers: ['localhost:9092'],
 });
 
-async function produceData(): Promise<void> {
-  const producer = kafka.producer();
-  await producer.connect();
-  const messages: Message[] = [];
-  for (let i = 0; i < 1000; i += 1) {
-    messages.push({value: `message${i}`});
-  }
-  await producer.sendBatch({
-    topicMessages: [
-      {
-        topic: 'kafka_test',
-        messages,
-      }
-    ],
-  })
-  await producer.disconnect();
+const GROUP_ID = 'test_group';
+
+function waitForGroupJoin(consumer: Consumer): Promise<void> {
+  return new Promise((res) => {
+    const remove = consumer.on(consumer.events.GROUP_JOIN, () => {
+      remove();
+      res();
+    });
+  });
 }
 
-function newOffset(offset: string): string {
-  return (BigInt(offset) + BigInt(1)).toString();
+async function getTopicInd(admin: Admin): Promise<number> {
+  const topics = await admin.listTopics();
+  const testTopics = topics.filter((it) => it.startsWith('test_'));
+  console.log('Test topics count: ', testTopics.length);
+  return testTopics.length;
+}
+
+async function createTopic(admin: Admin, topic: string): Promise<void> {
+  await admin.createTopics({
+    topics: [
+      {
+        topic,
+        numPartitions: 3,
+      },
+    ],
+  });
+}
+
+const metaStore = new ConsumerMetaStorage();
+
+async function createConsumer(id: string): Promise<Consumer> {
+  const consumer = kafka.consumer({
+    groupId: GROUP_ID,
+  });
+  metaStore.setupStore(id, consumer);
+  const groupJoin = waitForGroupJoin(consumer);
+  await consumer.connect();
+  await consumer.subscribe({
+    topic: /test_.*/,
+  });
+  await consumer.run({
+    eachMessage: async () => {},
+  });
+  await groupJoin;
+  return consumer;
 }
 
 async function main(): Promise<void> {
-  await produceData();
-  const consumer = kafka.consumer({
-    readUncommitted: false,
-    groupId: 'test_group',
-  });
-  await consumer.connect();
-  const producer = kafka.producer({
-    transactionalId: 'test_transaction',
-    maxInFlightRequests: 1,
-    idempotent: true,
-  });
-  await producer.connect();
-  await consumer.subscribe({ topic: 'kafka_test', fromBeginning: true });
-  await consumer.run({
-    autoCommit: false,
-    eachBatchAutoResolve: false,
-    eachBatch: async ({ batch, heartbeat, resolveOffset }) => {
-      const interval = setInterval(() => heartbeat(), 1000);
-      for (const message of batch.messages) {
-        try {
-          const transaction = await producer.transaction();
-          await transaction.sendOffsets({
-            topics: [
-              {
-                topic: batch.topic,
-                partitions: [
-                  {
-                    partition: batch.partition,
-                    offset: newOffset(message.offset),
-                  }
-                ],
-              },
-            ],
-            consumerGroupId: 'test_group',
-          });
-          console.log('Consuming message: ', message.offset);
-          await new Promise((res) => setTimeout(res, 100));
-          await transaction.commit();
-          // await new Promise((res) => setTimeout(res, 100));
-          resolveOffset(message.offset);
-        } catch (e) {
-          if (e.code === 51) {
-            console.log('----------------');
-            console.log('We got a problem');
-            console.log('----------------');
-            process.exit(1);
-          }
-        }
-      }
-      clearInterval(interval);
-    },
-  });
+  const admin = kafka.admin();
+  const startInd = await getTopicInd(admin);
+  console.log('New topic will start with ind: ', startInd);
+  await createTopic(admin, `test_${startInd}`);
+  const consumer1 = await createConsumer('one');
+  console.log('consumer 1 joined the group');
+  const newTopic = `test_${startInd + 1}`;
+  await createTopic(admin, newTopic);
+  const consumer2 = await createConsumer('two');
+  console.log('consumer 2 joined the group');
+  await new Promise((res) => setTimeout(res, 1000));
+  // do not handle other updates we shutdown the group
+  metaStore.stop();
+  await Promise.all([consumer1.disconnect(), consumer2.disconnect()]);
+  await admin.disconnect();
+  const oneAssignment = metaStore.store.one.memberAssignment;
+  const twoAssignment = metaStore.store.two.memberAssignment;
+  console.log(oneAssignment, twoAssignment);
+  console.log('One has new topic: ', Object.keys(oneAssignment).includes(newTopic))
+  console.log('Two has new topic: ', Object.keys(oneAssignment).includes(newTopic))
 }
 
 main().catch(console.error.bind(console));
